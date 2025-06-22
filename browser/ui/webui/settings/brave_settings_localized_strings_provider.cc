@@ -1075,6 +1075,13 @@ void BraveAddCommonStrings(content::WebUIDataSource* html_source,
       "extensionsV2Warn",
       l10n_util::GetStringFUTF16(IDS_SETTINGS_MANAGE_EXTENSIONS_V2_WARN,
                                  kExtensionsV2LearnMoreURL));
+
+  // Override the page title (tab text) for Settings to a test value.
+  // The template "settings.html" uses $i18n{settings}.
+  // By adding a literal string with that key after localized strings are
+  // added, this value takes precedence at runtime without depending on GRIT
+  // ordering rules.
+  //   html_source->AddString("settings", "TESTsettings");
 }  // NOLINT(readability/fn_size)
 
 void BraveAddResources(content::WebUIDataSource* html_source,
