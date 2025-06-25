@@ -104,6 +104,8 @@
 #include "brave/browser/ui/sidebar/sidebar_tab_helper.h"
 #endif
 
+#include "brave/browser/user_action_logger.h"
+
 namespace brave {
 
 void AttachTabHelpers(content::WebContents* web_contents) {
@@ -227,6 +229,9 @@ void AttachTabHelpers(content::WebContents* web_contents) {
     }
   }
 #endif  // BUILDFLAG(ENABLE_PLAYLIST)
+
+  // Register global user action logger for navigation events.
+  UserActionLoggerTabHelper::CreateForWebContents(web_contents);
 }
 
 }  // namespace brave
