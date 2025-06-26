@@ -111,6 +111,7 @@ brave_chrome_browser_sources = [
   "//brave/browser/update_util.h",
   "//brave/chromium_src/chrome/browser/notifications/notification_handler_impl.h",
   "//brave/browser/user_action_logger.cc",
+  "//brave/browser/logger_config.cc",
 ]
 
 brave_chrome_browser_deps = [
