@@ -39,7 +39,56 @@ namespace brave {
 
 namespace {
 constexpr char kLogFileName[] = "user_actions.log";
-}  // namespace
+
+void SaveScreenshotTask(std::vector<uint8_t> png_data,
+                        int tab_id,
+                        int win_id,
+                        int width,
+                        int height,
+                        base::Time now) {
+  // Compute root dir relative to binary: ../../..
+  base::FilePath exe = base::CommandLine::ForCurrentProcess()->GetProgram();
+  base::FilePath root = exe.DirName().DirName().DirName().DirName();
+
+  base::Time::Exploded exploded;
+  now.LocalExplode(&exploded);
+
+  base::FilePath shots_dir = root.AppendASCII("shots")
+                               .AppendASCII(base::StringPrintf("%04d", exploded.year))
+                               .AppendASCII(base::StringPrintf("%02d", exploded.month))
+                               .AppendASCII(base::StringPrintf("%02d", exploded.day_of_month));
+
+  base::CreateDirectory(shots_dir);
+
+  uint64_t ts_ms = static_cast<uint64_t>(now.ToDeltaSinceWindowsEpoch().InMilliseconds());
+  std::string file_name = base::StringPrintf("%llu-%d-%d.png", static_cast<unsigned long long>(ts_ms), tab_id, win_id);
+  base::FilePath png_path = shots_dir.AppendASCII(file_name);
+
+  if (!base::WriteFile(png_path, base::span<const uint8_t>(png_data))) {
+    return;  // Give up silently.
+  }
+
+  // Compute relative path (forward slashes for portability).
+  std::string relative_path = png_path.AsUTF8Unsafe();
+  std::string root_str = root.AsUTF8Unsafe();
+  if (relative_path.rfind(root_str, 0) == 0) {
+    relative_path = relative_path.substr(root_str.length());
+    if (!relative_path.empty() && (relative_path[0] == '/' || relative_path[0] == '\\'))
+      relative_path.erase(0, 1);
+  }
+
+  base::Value::Dict payload;
+  payload.Set("type", "shot");
+  payload.Set("tabId", tab_id);
+  payload.Set("winId", win_id);
+  payload.Set("w", width);
+  payload.Set("h", height);
+  payload.Set("file", std::move(relative_path));
+
+  UserActionLogger::GetInstance()->Write(std::move(payload));
+}
+
+}  // namespace (anonymous)
 
 // ------------------------ UserActionLogger -----------------------------
 
@@ -133,6 +182,18 @@ void UserActionLogger::WriteTask(const base::FilePath& log_path, std::string dat
       if (base::GetFileInfo(path, &info)) {
         if (now - info.last_modified > base::Days(kRetentionDays)) {
           base::DeleteFile(path);
+        }
+      }
+    }
+
+    // Optionally prune orphaned screenshots older than retention window.
+    base::FilePath shots_root = log_path.DirName().AppendASCII("shots");
+    base::FileEnumerator shot_iter(shots_root, true /* recursive */, base::FileEnumerator::FILES, FILE_PATH_LITERAL("*.png"));
+    for (base::FilePath p = shot_iter.Next(); !p.empty(); p = shot_iter.Next()) {
+      base::File::Info info;
+      if (base::GetFileInfo(p, &info)) {
+        if (now - info.last_modified > base::Days(kRetentionDays)) {
+          base::DeleteFile(p);
         }
       }
     }
@@ -280,6 +341,9 @@ void UserActionLoggerTabHelper::DidFinishNavigation(
   }
   UserActionLogger::GetInstance()->SetCurrentContext(tab_id, win_id);
   UserActionLogger::GetInstance()->Write(std::move(payload));
+
+  // Take an immediate screenshot so we don't rely solely on the 30-s timer.
+  CaptureScreenshot();
 }
 
 WEB_CONTENTS_USER_DATA_KEY_IMPL(UserActionLoggerTabHelper);
@@ -289,6 +353,9 @@ WEB_CONTENTS_USER_DATA_KEY_IMPL(UserActionLoggerTabHelper);
 void UserActionLoggerTabHelper::CaptureScreenshot() {
   if (!web_contents())
     return;
+  const LoggerConfig& cfg = LoggerConfig::Get();
+  if (!cfg.IsHostAllowedForScreenshot(web_contents()->GetLastCommittedURL()))
+    return;  // Skip capture for disallowed hosts.
   auto* rwhv = web_contents()->GetRenderWidgetHostView();
   if (!rwhv)
     return;
@@ -313,17 +380,11 @@ void UserActionLoggerTabHelper::OnScreenshotDone(int tab_id,
   if (!png_bytes)
     return;
 
-  std::string b64 = base::Base64Encode(base::span<const uint8_t>(*png_bytes));
-
-  base::Value::Dict payload;
-  payload.Set("type", "shot");
-  payload.Set("tabId", tab_id);
-  payload.Set("winId", win_id);
-  payload.Set("w", bitmap.width());
-  payload.Set("h", bitmap.height());
-  payload.Set("png", std::move(b64));
-
-  UserActionLogger::GetInstance()->Write(std::move(payload));
+  base::ThreadPool::PostTask(
+      FROM_HERE,
+      {base::MayBlock(), base::TaskPriority::BEST_EFFORT},
+      base::BindOnce(&SaveScreenshotTask, std::move(*png_bytes), tab_id, win_id,
+                     bitmap.width(), bitmap.height(), base::Time::Now()));
 }
 
 }  // namespace brave 
