@@ -45,6 +45,9 @@ class UserActionLogger : public ui::EventHandler {
   // (e.g., "password", "email", or empty when not in editable field).
   void SetCurrentInputType(const std::string& type) { current_input_type_ = type; }
 
+  // Returns the directory in which the log file lives (i.e., <root>/).
+  const base::FilePath& root_dir() const { return root_dir_; }
+
  private:
   friend class base::NoDestructor<UserActionLogger>;
   UserActionLogger();
@@ -55,6 +58,9 @@ class UserActionLogger : public ui::EventHandler {
   int current_tab_id_ = -1;
   int current_window_id_ = -1;
   std::string current_input_type_;
+
+  // Directory that contains user_actions.log; also the base for shots/.
+  base::FilePath root_dir_;
 };
 
 // Per-tab helper used to observe navigation events and funnel them into the

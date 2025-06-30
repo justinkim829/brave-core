@@ -6,6 +6,7 @@
 #include "ui/events/keycodes/keyboard_codes.h"
 #include "ui/events/event.h"
 #include "ui/events/keycodes/dom/keycode_converter.h"
+#include "build/build_config.h"
 #if defined(USE_AURA)
 #include "ui/aura/env.h"
 #endif
@@ -32,8 +33,15 @@
 #include "brave/browser/logger_config.h"
 #include "ui/base/ime/input_method.h"
 #include "ui/base/ime/text_input_type.h"
+#if defined(USE_AURA) && !BUILDFLAG(IS_MAC)
 #include "ui/aura/window.h"
 #include "ui/aura/window_tree_host.h"
+#endif  // defined(USE_AURA) && !BUILDFLAG(IS_MAC)
+#include "base/environment.h"
+#if BUILDFLAG(IS_MAC)
+#include <ApplicationServices/ApplicationServices.h>
+#endif
+#include "base/task/single_thread_task_runner.h"
 
 namespace brave {
 
@@ -46,9 +54,8 @@ void SaveScreenshotTask(std::vector<uint8_t> png_data,
                         int width,
                         int height,
                         base::Time now) {
-  // Compute root dir relative to binary: ../../..
-  base::FilePath exe = base::CommandLine::ForCurrentProcess()->GetProgram();
-  base::FilePath root = exe.DirName().DirName().DirName().DirName();
+  // Use the same root as user_actions.log (resolves correctly for .app bundles)
+  base::FilePath root = UserActionLogger::GetInstance()->root_dir();
 
   base::Time::Exploded exploded;
   now.LocalExplode(&exploded);
@@ -79,8 +86,8 @@ void SaveScreenshotTask(std::vector<uint8_t> png_data,
 
   base::Value::Dict payload;
   payload.Set("type", "shot");
-  payload.Set("tabId", tab_id);
-  payload.Set("winId", win_id);
+  payload.Set("tab_id", tab_id);
+  payload.Set("win_id", win_id);
   payload.Set("w", width);
   payload.Set("h", height);
   payload.Set("file", std::move(relative_path));
@@ -88,15 +95,115 @@ void SaveScreenshotTask(std::vector<uint8_t> png_data,
   UserActionLogger::GetInstance()->Write(std::move(payload));
 }
 
+#if BUILDFLAG(IS_MAC)
+namespace {
+
+static CFMachPortRef g_event_tap = nullptr;
+
+CGEventRef MacEventTapCallback(CGEventTapProxy /*proxy*/, CGEventType type,
+                               CGEventRef event, void* /*user_info*/) {
+  // Re-enable tap if it was disabled by the system.
+  if (type == kCGEventTapDisabledByTimeout && g_event_tap) {
+    CGEventTapEnable(g_event_tap, true);
+    return event;
+  }
+
+  if (type != kCGEventKeyDown && type != kCGEventKeyUp &&
+      type != kCGEventLeftMouseDown)
+    return event;
+
+  brave::UserActionLogger* logger = brave::UserActionLogger::GetInstance();
+  base::Value::Dict payload;
+
+  uint64_t flags = CGEventGetFlags(event);
+  bool ctrl  = (flags & kCGEventFlagMaskControl) != 0;
+  bool shift = (flags & kCGEventFlagMaskShift) != 0;
+  bool alt   = (flags & kCGEventFlagMaskAlternate) != 0;
+
+  if (type == kCGEventKeyDown || type == kCGEventKeyUp) {
+    payload.Set("type", "key");
+    payload.Set("down", type == kCGEventKeyDown);
+    // Raw keycode (hardware) – good enough for now.
+    int64_t keycode = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
+    ui::DomCode dom_code = ui::KeycodeConverter::NativeKeycodeToDomCode(static_cast<int>(keycode));
+    std::string code_str = ui::KeycodeConverter::DomCodeToCodeString(dom_code);
+    payload.Set("code", std::move(code_str));
+    payload.Set("ctrl", ctrl);
+    payload.Set("shift", shift);
+    payload.Set("alt", alt);
+  } else {
+    payload.Set("type", "click");
+    CGPoint loc = CGEventGetLocation(event);
+    payload.Set("x", static_cast<int>(loc.x));
+    payload.Set("y", static_cast<int>(loc.y));
+    payload.Set("button", 1);
+  }
+
+  logger->Write(std::move(payload));
+  return event;
+}
+}  // namespace
+#endif  // BUILDFLAG(IS_MAC)
+
 }  // namespace (anonymous)
 
 // ------------------------ UserActionLogger -----------------------------
 
 UserActionLogger::UserActionLogger() {
   base::FilePath exe = base::CommandLine::ForCurrentProcess()->GetProgram();
-  base::FilePath root = exe.DirName().DirName().DirName().DirName();
-  log_path_ = root.AppendASCII(kLogFileName);
-  base::CreateDirectory(root);
+
+  // 1. Respect BRAVE_LOGGER_PATH env variable if set (absolute path to the
+  //    desired log file, not directory). This gives power users full control.
+  std::unique_ptr<base::Environment> env(base::Environment::Create());
+  if (auto opt_path = env->GetVar("BRAVE_LOGGER_PATH"); opt_path && !opt_path->empty()) {
+    log_path_ = base::FilePath::FromUTF8Unsafe(*opt_path);
+  } else {
+    // 2. Otherwise, walk up the ancestor chain until we find the workspace
+    //    folder named "meteor". This lets packaged .app bundles on macOS and
+    //    deep out/Component_* trees still resolve to the developer root.
+    base::FilePath cursor = exe.DirName();
+    const int kMaxAscend = 20;  // safety guard
+    int steps = 0;
+    while (!cursor.empty() && steps++ < kMaxAscend) {
+      if (cursor.BaseName().MaybeAsASCII() == "meteor")
+        break;
+      cursor = cursor.DirName();
+    }
+
+    base::FilePath root;
+    if (!cursor.empty() && cursor.BaseName().MaybeAsASCII() == "meteor") {
+      root = cursor;
+    } else {
+      // Fallback to historical behaviour: 4 dirs above the binary.
+      root = exe.DirName().DirName().DirName().DirName();
+    }
+
+    log_path_ = root.AppendASCII(kLogFileName);
+  }
+
+  // Record the resolved root directory for reuse (e.g., screenshots).
+  root_dir_ = log_path_.DirName();
+
+  base::CreateDirectory(log_path_.DirName());
+
+#if BUILDFLAG(IS_MAC)
+  // macOS doesn't deliver Aura pre-target events; install a CGEventTap to
+  // capture keys and primary-button clicks at the session level.
+  {
+    CGEventMask mask = (1ull << kCGEventKeyDown) | (1ull << kCGEventKeyUp) |
+                       (1ull << kCGEventLeftMouseDown);
+    CFMachPortRef tap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap,
+                                         kCGEventTapOptionDefault, mask,
+                                         MacEventTapCallback, nullptr);
+    if (tap) {
+      g_event_tap = tap;
+      CFRunLoopSourceRef src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0);
+      CFRunLoopAddSource(CFRunLoopGetCurrent(), src, kCFRunLoopCommonModes);
+      CGEventTapEnable(tap, true);
+      CFRelease(src);
+    }
+  }
+#endif
 
   task_runner_ = base::ThreadPool::CreateSequencedTaskRunner({base::MayBlock(), base::TaskPriority::BEST_EFFORT, base::TaskShutdownBehavior::BLOCK_SHUTDOWN});
 #if defined(USE_AURA)
@@ -215,7 +322,7 @@ void UserActionLogger::OnKeyEvent(ui::KeyEvent* event) {
   // Determine input field type via the platform InputMethod associated with
   // the focused window. This lets us detect <input type="password"> etc.
   std::string field_type;
-#if defined(USE_AURA)
+#if defined(USE_AURA) && !BUILDFLAG(IS_MAC)
   aura::Env* env = aura::Env::GetInstance();
   if (env) {
     for (auto host_raw : env->window_tree_hosts()) {
@@ -265,9 +372,9 @@ void UserActionLogger::OnKeyEvent(ui::KeyEvent* event) {
   payload.Set("shift", (event->flags() & ui::EF_SHIFT_DOWN) != 0);
   payload.Set("alt", (event->flags() & ui::EF_ALT_DOWN) != 0);
   if (current_tab_id_ != -1)
-    payload.Set("tabId", current_tab_id_);
+    payload.Set("tab_id", current_tab_id_);
   if (current_window_id_ != -1)
-    payload.Set("winId", current_window_id_);
+    payload.Set("win_id", current_window_id_);
   Write(std::move(payload));
 }
 
@@ -281,9 +388,9 @@ void UserActionLogger::OnMouseEvent(ui::MouseEvent* event) {
   payload.Set("y", event->y());
   payload.Set("button", static_cast<int>(event->changed_button_flags()));
   if (current_tab_id_ != -1)
-    payload.Set("tabId", current_tab_id_);
+    payload.Set("tab_id", current_tab_id_);
   if (current_window_id_ != -1)
-    payload.Set("winId", current_window_id_);
+    payload.Set("win_id", current_window_id_);
   Write(std::move(payload));
 }
 
@@ -325,9 +432,9 @@ void UserActionLoggerTabHelper::DidFinishNavigation(
   int tab_id = tab_id_obj.id();
   int win_id = win_id_obj.id();
   if (tab_id_obj.is_valid())
-    payload.Set("tabId", tab_id);
+    payload.Set("tab_id", tab_id);
   if (win_id_obj.is_valid())
-    payload.Set("winId", win_id);
+    payload.Set("win_id", win_id);
   // Title (UTF8)
   std::string title_utf8 = base::UTF16ToUTF8(handle->GetWebContents()->GetTitle());
   if (!title_utf8.empty())
@@ -336,14 +443,21 @@ void UserActionLoggerTabHelper::DidFinishNavigation(
   // Viewport size in device-independent pixels.
   if (auto* rwhv = handle->GetWebContents()->GetRenderWidgetHostView()) {
     gfx::Rect bounds = rwhv->GetViewBounds();
-    payload.Set("vpW", bounds.width());
-    payload.Set("vpH", bounds.height());
+    base::Value::Dict vp;
+    vp.Set("w", bounds.width());
+    vp.Set("h", bounds.height());
+    payload.Set("vp", std::move(vp));
   }
   UserActionLogger::GetInstance()->SetCurrentContext(tab_id, win_id);
   UserActionLogger::GetInstance()->Write(std::move(payload));
 
-  // Take an immediate screenshot so we don't rely solely on the 30-s timer.
-  CaptureScreenshot();
+  // Schedule a screenshot 1 s after navigation commit so the first paint has
+  // time to finish; this prevents empty bitmaps on macOS.
+  base::SingleThreadTaskRunner::GetCurrentDefault()->PostDelayedTask(
+      FROM_HERE,
+      base::BindOnce(&UserActionLoggerTabHelper::CaptureScreenshot,
+                     weak_factory_.GetWeakPtr()),
+      base::Seconds(1));
 }
 
 WEB_CONTENTS_USER_DATA_KEY_IMPL(UserActionLoggerTabHelper);
@@ -373,12 +487,33 @@ void UserActionLoggerTabHelper::CaptureScreenshot() {
 void UserActionLoggerTabHelper::OnScreenshotDone(int tab_id,
                                                 int win_id,
                                                 const SkBitmap& bitmap) {
-  if (!bitmap.readyToDraw())
+  // Some platforms may deliver a bitmap without pixel data immediately; fall
+  // back to writing a metadata-only shot event so the timeline still shows the
+  // capture point. Only bail out entirely if there is no pixel data *and* no
+  // dimensions.
+
+  if (!bitmap.readyToDraw() && (bitmap.width() == 0 || bitmap.height() == 0)) {
+    // Log stub event so downstream agent knows a frame boundary even though we
+    // lacked pixels.
+    base::Value::Dict payload;
+    payload.Set("type", "shot");
+    payload.Set("tab_id", tab_id);
+    payload.Set("win_id", win_id);
+    UserActionLogger::GetInstance()->Write(std::move(payload));
     return;
+  }
 
   std::optional<std::vector<uint8_t>> png_bytes = gfx::PNGCodec::FastEncodeBGRASkBitmap(bitmap, /*discard_transparency=*/false);
-  if (!png_bytes)
+  if (!png_bytes) {
+    base::Value::Dict payload;
+    payload.Set("type", "shot");
+    payload.Set("tab_id", tab_id);
+    payload.Set("win_id", win_id);
+    payload.Set("w", bitmap.width());
+    payload.Set("h", bitmap.height());
+    UserActionLogger::GetInstance()->Write(std::move(payload));
     return;
+  }
 
   base::ThreadPool::PostTask(
       FROM_HERE,
